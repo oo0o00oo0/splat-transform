@@ -33,6 +33,30 @@ type LodMeta = {
     tree: MetaNode;
 };
 
+type IdentityManifestFile = {
+    fileIndex: number;
+    filename: string;
+    count: number;
+    sidecars: {
+        sourceSplatId: string;
+        atomId: string;
+        chunkId: string;
+        flags: string;
+    };
+};
+
+const identityColumns = {
+    sourceSplatId: 'source_splat_id',
+    atomId: 'atom_id',
+    chunkId: 'chunk_id',
+    flags: 'lod_identity_flags'
+};
+
+const identityFlag = {
+    aggregateSource: 1 << 3,
+    unsafeWrite: 1 << 7
+};
+
 const boundUnion = (result: Aabb, a: Aabb, b: Aabb) => {
     const am = a.min;
     const aM = a.max;
@@ -134,6 +158,40 @@ const binIndices = (parent: BTreeNode, lod: TypedArray) => {
     return result;
 };
 
+const hasIdentityColumns = (dataTable: DataTable) => {
+    return dataTable.hasColumn(identityColumns.sourceSplatId) &&
+        dataTable.hasColumn(identityColumns.atomId) &&
+        dataTable.hasColumn(identityColumns.chunkId);
+};
+
+const encodeU32 = (values: TypedArray) => {
+    const result = new Uint8Array(values.length * 4);
+    const view = new DataView(result.buffer);
+    for (let i = 0; i < values.length; ++i) {
+        view.setUint32(i * 4, values[i] >>> 0, true);
+    }
+    return result;
+};
+
+const encodeFlags = (dataTable: DataTable, lodValue: number) => {
+    const source = dataTable.getColumnByName(identityColumns.flags)?.data;
+    const result = new Uint8Array(dataTable.numRows);
+    const lodFlag = lodValue > 0 ? identityFlag.aggregateSource | identityFlag.unsafeWrite : 0;
+
+    for (let i = 0; i < result.length; ++i) {
+        result[i] = ((source?.[i] ?? 0) | lodFlag) & 0xff;
+    }
+
+    return result;
+};
+
+const writeBytes = async (fs: FileSystem, filename: string, bytes: Uint8Array) => {
+    const writer = await fs.createWriter(filename);
+    await writer.write(bytes);
+    await writer.close();
+    logWrittenFile(filename, writer.bytesWritten);
+};
+
 type WriteLodOptions = {
     filename: string;
     dataTable: DataTable;
@@ -191,6 +249,8 @@ const writeLod = async (options: WriteLodOptions, fs: FileSystem) => {
     // fileBin: number[][]
     const lodFiles: Map<number, number[][][]> = new Map();
     const lodColumn = dataTable.getColumnByName('lod')?.data;
+    const writesIdentity = hasIdentityColumns(dataTable);
+    const identityFiles: IdentityManifestFile[] = [];
     const filenames: string[] = [];
     let lodLevels = 0;
 
@@ -344,6 +404,48 @@ const writeLod = async (options: WriteLodOptions, fs: FileSystem) => {
 
                 // construct a new table from the ordered data
                 const unitDataTable = dataTable.clone({ rows: indices });
+                if (writesIdentity) {
+                    const filename = `${lodValue}_${i}/meta.json`;
+                    const fileIndex = filenames.indexOf(filename);
+                    if (fileIndex === -1) {
+                        throw new Error(`LOD identity file is not present in lod-meta filenames: ${filename}`);
+                    }
+
+                    const identityPrefix = `identity/file-${String(fileIndex).padStart(3, '0')}`;
+                    await fs.mkdir(resolve(outputDir, 'identity'));
+                    await writeBytes(
+                        fs,
+                        resolve(outputDir, `${identityPrefix}.source_splat_id.u32.bin`),
+                        encodeU32(unitDataTable.getColumnByName(identityColumns.sourceSplatId)!.data)
+                    );
+                    await writeBytes(
+                        fs,
+                        resolve(outputDir, `${identityPrefix}.atom_id.u32.bin`),
+                        encodeU32(unitDataTable.getColumnByName(identityColumns.atomId)!.data)
+                    );
+                    await writeBytes(
+                        fs,
+                        resolve(outputDir, `${identityPrefix}.chunk_id.u32.bin`),
+                        encodeU32(unitDataTable.getColumnByName(identityColumns.chunkId)!.data)
+                    );
+                    await writeBytes(
+                        fs,
+                        resolve(outputDir, `${identityPrefix}.flags.u8.bin`),
+                        encodeFlags(unitDataTable, lodValue)
+                    );
+
+                    identityFiles.push({
+                        fileIndex,
+                        filename,
+                        count: unitDataTable.numRows,
+                        sidecars: {
+                            sourceSplatId: `${identityPrefix}.source_splat_id.u32.bin`,
+                            atomId: `${identityPrefix}.atom_id.u32.bin`,
+                            chunkId: `${identityPrefix}.chunk_id.u32.bin`,
+                            flags: `${identityPrefix}.flags.u8.bin`
+                        }
+                    });
+                }
 
                 // reset indices since we've generated ordering on the individual subunits
                 for (let j = 0; j < indices.length; ++j) {
@@ -364,6 +466,27 @@ const writeLod = async (options: WriteLodOptions, fs: FileSystem) => {
                 unitGroup.end();
             }
         }
+    }
+
+    if (writesIdentity) {
+        const identityJson = (new TextEncoder()).encode(JSON.stringify({
+            version: 1,
+            fixture: false,
+            visualPayload: 'playcanvas-streamed-sog',
+            lodPackageId: basename(outputDir),
+            address: ['lod_package_id', 'file_index', 'local_splat_index'],
+            source: {
+                sourceSplatIdColumn: identityColumns.sourceSplatId,
+                atomIdColumn: identityColumns.atomId,
+                chunkIdColumn: identityColumns.chunkId,
+                flagsColumn: identityColumns.flags,
+                atomIdMap: 'source/atom_id.u32.bin',
+                chunks: 'source/chunks.json',
+                summary: 'source/reef-sample-summary.json'
+            },
+            files: identityFiles.sort((a, b) => a.fileIndex - b.fileIndex)
+        }));
+        await writeBytes(fs, resolve(outputDir, 'identity.json'), identityJson);
     }
 
     writingGroup.end();

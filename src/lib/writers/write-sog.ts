@@ -35,6 +35,35 @@ const identity = (index: number) => {
     return index;
 };
 
+const noChunk = 0xffffffff;
+
+const paletteColor = (id: number) => {
+    const hue = ((id >>> 0) * 0.61803398875) % 1;
+    const saturation = 0.72;
+    const value = 0.95;
+    const h = hue * 6;
+    const c = value * saturation;
+    const x = c * (1 - Math.abs((h % 2) - 1));
+    const m = value - c;
+
+    let rgb;
+    if (h < 1) {
+        rgb = [c, x, 0];
+    } else if (h < 2) {
+        rgb = [x, c, 0];
+    } else if (h < 3) {
+        rgb = [0, c, x];
+    } else if (h < 4) {
+        rgb = [0, x, c];
+    } else if (h < 5) {
+        rgb = [x, 0, c];
+    } else {
+        rgb = [c, 0, x];
+    }
+
+    return rgb.map(v => Math.round((v + m) * 255));
+};
+
 const generateIndices = (dataTable: DataTable) => {
     const result = new Uint32Array(dataTable.numRows);
     for (let i = 0; i < result.length; ++i) {
@@ -253,6 +282,34 @@ const writeSog = async (options: WriteSogOptions, fs: FileSystem) => {
         return Array.from(colorData.centroids.getColumn(0).data);
     };
 
+    const writeFeatureColor = async () => {
+        const chunkId = dataTable.getColumnByName('chunk_id')?.data;
+        if (!chunkId) {
+            return null;
+        }
+
+        const data = new Uint8Array(width * height * channels);
+        for (let i = 0; i < indices.length; ++i) {
+            const row = indices[i];
+            const id = chunkId[row] >>> 0;
+            const color = id === noChunk ? [52, 52, 58] : paletteColor(id);
+            const ti = layout(i) * channels;
+            data[ti + 0] = color[0];
+            data[ti + 1] = color[1];
+            data[ti + 2] = color[2];
+            data[ti + 3] = 255;
+        }
+
+        await writeWebp('feature_color.webp', data);
+
+        return {
+            semantic: 'chunk_id',
+            encoding: 'rgb8-palette-v1',
+            noChunk,
+            files: ['feature_color.webp']
+        };
+    };
+
     const writeSH = async (shBands: number) => {
         const shCoeffs = [0, 3, 8, 15][shBands];
         const shColumnNames = shRestNames.slice(0, shCoeffs * 3);
@@ -326,6 +383,7 @@ const writeSog = async (options: WriteSogOptions, fs: FileSystem) => {
         await writeQuaternions();
         const scalesCodebook = await writeScales();
         const colorsCodebook = await writeColors();
+        const featureColor = await writeFeatureColor();
 
         let shN = null;
         if (shBands > 0) {
@@ -358,6 +416,7 @@ const writeSog = async (options: WriteSogOptions, fs: FileSystem) => {
                 codebook: colorsCodebook,
                 files: ['sh0.webp']
             },
+            ...(featureColor ? { featureColor } : {}),
             ...(shN ? { shN } : {})
         };
 
