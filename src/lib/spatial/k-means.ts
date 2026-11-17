@@ -41,30 +41,6 @@ const initializeCentroids1D = (dataTable: DataTable, centroids: DataTable) => {
     }
 };
 
-const calcAverage = (dataTable: DataTable, cluster: number[], row: any) => {
-    const keys = dataTable.columnNames;
-
-    for (let i = 0; i < keys.length; ++i) {
-        row[keys[i]] = 0;
-    }
-
-    const dataRow: any = {};
-    for (let i = 0; i < cluster.length; ++i) {
-        dataTable.getRow(cluster[i], dataRow);
-
-        for (let j = 0; j < keys.length; ++j) {
-            const key = keys[j];
-            row[key] += dataRow[key];
-        }
-    }
-
-    if (cluster.length > 0) {
-        for (let i = 0; i < keys.length; ++i) {
-            row[keys[i]] /= cluster.length;
-        }
-    }
-};
-
 const clusterKdTreeCpu = (points: DataTable, centroids: DataTable, labels: Uint32Array) => {
     const kdTree = new KdTree(centroids);
 
@@ -83,20 +59,6 @@ const clusterKdTreeCpu = (points: DataTable, centroids: DataTable, labels: Uint3
 
         labels[i] = a.index;
     }
-};
-
-const groupLabels = (labels: Uint32Array, k: number) => {
-    const clusters: number[][] = [];
-
-    for (let i = 0; i < k; ++i) {
-        clusters[i] = [];
-    }
-
-    for (let i = 0; i < labels.length; ++i) {
-        clusters[labels[i]].push(i);
-    }
-
-    return clusters;
 };
 
 const kmeans = async (points: DataTable, k: number, iterations: number, device?: GraphicsDevice) => {
@@ -121,8 +83,10 @@ const kmeans = async (points: DataTable, k: number, iterations: number, device?:
         initializeCentroids(points, centroids, row);
     }
 
-    const gpuClustering = device && new GpuClustering(device, points.numColumns, k);
+    const gpuClustering = device && new GpuClustering(device, points, k);
     const labels = new Uint32Array(points.numRows);
+    const counts = new Uint32Array(k);
+    const sums = new Float64Array(k);
 
     let converged = false;
     let steps = 0;
@@ -133,21 +97,34 @@ const kmeans = async (points: DataTable, k: number, iterations: number, device?:
     try {
         while (!converged) {
             if (gpuClustering) {
-                await gpuClustering.execute(points, centroids, labels);
+                await gpuClustering.execute(centroids, labels);
             } else {
                 clusterKdTreeCpu(points, centroids, labels);
             }
 
-            // calculate the new centroid positions
-            const groups = groupLabels(labels, k);
+            counts.fill(0);
+            for (let i = 0; i < labels.length; ++i) {
+                counts[labels[i]]++;
+            }
+            for (let c = 0; c < points.numColumns; ++c) {
+                const source = points.columns[c].data;
+                const target = centroids.columns[c].data;
+                sums.fill(0);
+                // Ascending rows and f64 sums preserve each original centroid's reduction order.
+                for (let i = 0; i < labels.length; ++i) {
+                    sums[labels[i]] += source[i];
+                }
+                for (let i = 0; i < k; ++i) {
+                    if (counts[i] > 0) {
+                        target[i] = sums[i] / counts[i];
+                    }
+                }
+            }
             for (let i = 0; i < centroids.numRows; ++i) {
-                if (groups[i].length === 0) {
+                if (counts[i] === 0) {
                     // re-seed this centroid to a random point to avoid zero vector
                     const idx = Math.floor(Math.random() * points.numRows);
                     points.getRow(idx, row);
-                    centroids.setRow(i, row);
-                } else {
-                    calcAverage(points, groups[i], row);
                     centroids.setRow(i, row);
                 }
             }

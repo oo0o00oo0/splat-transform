@@ -8,7 +8,6 @@ import {
     BindStorageBufferFormat,
     BindUniformBufferFormat,
     Compute,
-    FloatPacking,
     Shader,
     StorageBuffer,
     UniformBufferFormat,
@@ -17,6 +16,7 @@ import {
 } from 'playcanvas';
 
 import { DataTable } from '../data-table';
+import { ClusteringPoints, interleaveData } from './clustering-points';
 
 const clusterWgsl = (numColumns: number, useF16: boolean) => {
     const floatType = useF16 ? 'f16' : 'f32';
@@ -118,33 +118,12 @@ const roundUp = (value: number, multiple: number) => {
     return Math.ceil(value / multiple) * multiple;
 };
 
-const interleaveData = (result: Uint16Array | Float32Array, dataTable: DataTable, numRows: number, rowOffset: number) => {
-    const { numColumns } = dataTable;
-
-    if (result instanceof Uint16Array) {
-        // interleave shorts
-        for (let c = 0; c < numColumns; ++c) {
-            const column = dataTable.columns[c];
-            for (let r = 0; r < numRows; ++r) {
-                result[r * numColumns + c] = FloatPacking.float2Half(column.data[rowOffset + r]);
-            }
-        }
-    } else {
-        // interleave floats
-        for (let c = 0; c < numColumns; ++c) {
-            const column = dataTable.columns[c];
-            for (let r = 0; r < numRows; ++r) {
-                result[r * numColumns + c] = column.data[rowOffset + r];
-            }
-        }
-    }
-};
-
 class GpuClustering {
-    execute: (points: DataTable, centroids: DataTable, labels: Uint32Array) => Promise<void>;
+    execute: (centroids: DataTable, labels: Uint32Array) => Promise<void>;
     destroy: () => void;
 
-    constructor(device: GraphicsDevice, numColumns: number, numCentroids: number) {
+    constructor(device: GraphicsDevice, points: DataTable, numCentroids: number) {
+        const { numColumns } = points;
 
         // Check if device supports f16
         const useF16 = !!('supportsShaderF16' in device && device.supportsShaderF16);
@@ -175,15 +154,9 @@ class GpuClustering {
             computeBindGroupFormat: bindGroupFormat
         });
 
-        const interleavedPoints = useF16 ? new Uint16Array(roundUp(numColumns * batchSize, 2)) : new Float32Array(numColumns * batchSize);
         const interleavedCentroids = useF16 ? new Uint16Array(roundUp(numColumns * numCentroids, 2)) : new Float32Array(numColumns * numCentroids);
         const resultsData = new Uint32Array(batchSize);
-
-        const pointsBuffer = new StorageBuffer(
-            device,
-            interleavedPoints.byteLength,
-            BUFFERUSAGE_COPY_DST
-        );
+        const pointBuffers = new ClusteringPoints(device, points, batchSize, useF16);
 
         const centroidsBuffer = new StorageBuffer(
             device,
@@ -198,11 +171,10 @@ class GpuClustering {
         );
 
         const compute = new Compute(device, shader, 'compute-cluster');
-        compute.setParameter('pointsBuffer', pointsBuffer);
         compute.setParameter('centroidsBuffer', centroidsBuffer);
         compute.setParameter('resultsBuffer', resultsBuffer);
 
-        this.execute = async (points: DataTable, centroids: DataTable, labels: Uint32Array) => {
+        this.execute = async (centroids: DataTable, labels: Uint32Array) => {
             const numPoints = points.numRows;
             const numBatches = Math.ceil(numPoints / batchSize);
 
@@ -215,9 +187,7 @@ class GpuClustering {
                 const currentBatchSize = Math.min(numPoints - batch * batchSize, batchSize);
                 const groups = Math.ceil(currentBatchSize / 64);
 
-                // write this batch of point data to gpu
-                interleaveData(interleavedPoints, points, currentBatchSize, batch * batchSize);
-                pointsBuffer.write(0, interleavedPoints, 0, useF16 ? roundUp(numColumns * currentBatchSize, 2) : numColumns * currentBatchSize);
+                compute.setParameter('pointsBuffer', pointBuffers.get(batch));
                 compute.setParameter('numPoints', currentBatchSize);
 
                 // start compute job
@@ -231,7 +201,7 @@ class GpuClustering {
         };
 
         this.destroy = () => {
-            pointsBuffer.destroy();
+            pointBuffers.destroy();
             centroidsBuffer.destroy();
             resultsBuffer.destroy();
             shader.destroy();
